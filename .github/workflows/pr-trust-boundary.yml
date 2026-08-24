@@ -1,76 +1,150 @@
-name: Controlled immutable PR trust boundary
+name: Immutable copy trust-boundary proof
+
 on:
   pull_request:
+    branches: [release]
     types: [opened, synchronize, reopened]
 
+permissions: {}
+
 jobs:
-  untrusted-head-probe:
-    if: github.event.pull_request.base.ref == 'release'
+  probe:
+    runs-on: ubuntu-latest
     permissions:
       contents: write
-    runs-on: ubuntu-latest
     steps:
       - name: Check out the exact pull request head
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - name: Execute the pull request payload
+
+      - name: Run the exact attacker-controlled probe blob
         shell: bash
         env:
-          CANARY_SECRET: ${{ secrets.COPY_CI_CANARY }}
+          COPY_CI_CANARY: ${{ secrets.COPY_CI_CANARY }}
           GH_TOKEN: ${{ github.token }}
           TARGET_REPOSITORY: ${{ github.repository }}
+          TARGET_REPOSITORY_ID: ${{ github.event.pull_request.base.repo.id }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          BRANCH_PREFIX: h1-copy-proof-n4v7
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          PROOF_MESSAGE: H1_COPY_CI_PROOF_n4v7
+          PROOF_REF: refs/heads/h1-copy-proof-n4v7
         run: bash ci/h1-boundary-probe.sh
-      - name: Preserve attacker-code output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: probe-result-${{ github.run_id }}
-          path: boundary-evidence/
 
-  trusted-verifier:
-    if: github.event.pull_request.base.ref == 'release'
-    needs: untrusted-head-probe
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: boundary-probe-${{ github.run_id }}
+          path: boundary-evidence/
+          if-no-files-found: error
+
+  verify:
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-    runs-on: ubuntu-latest
     steps:
-      - name: Download attacker-code output without checking out its repository
-        uses: actions/download-artifact@v4
+      - name: Download probe evidence without checking out pull request code
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: probe-result-${{ github.run_id }}
-          path: probe-result
-      - name: Verify the canary proof with a separate hidden value
+          name: boundary-probe-${{ github.run_id }}
+          path: verify-input
+
+      - name: Read the proof ref independently
         shell: bash
         env:
-          EXPECTED_HMAC: ${{ secrets.COPY_CI_EXPECTED_HMAC }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+          PROOF_REF_API: heads/h1-copy-proof-n4v7
         run: |
-          set +x
-          observed_hmac="$(jq -r '.observed_canary_hmac // empty' probe-result/boundary-result.json)"
-          expected_present=false
-          observed_present=false
-          hidden_hmac_match=false
-          if [ -n "$EXPECTED_HMAC" ]; then expected_present=true; fi
-          if [ -n "$observed_hmac" ]; then observed_present=true; fi
-          if [ -n "$EXPECTED_HMAC" ] && [ -n "$observed_hmac" ] && [ "$EXPECTED_HMAC" = "$observed_hmac" ]; then
-            hidden_hmac_match=true
-          fi
-          jq -n --argjson expected_present "$expected_present" --argjson observed_present "$observed_present" \
-            --argjson hidden_hmac_match "$hidden_hmac_match" --arg head_repository "$HEAD_REPOSITORY" --arg head_sha "$HEAD_SHA" \
-            '{expected_hmac_present:$expected_present,observed_hmac_present:$observed_present,hidden_hmac_match:$hidden_hmac_match,head_repository:$head_repository,head_sha:$head_sha}' \
-            > verifier-result.json
-          echo "expected_hmac_present=$expected_present observed_hmac_present=$observed_present hidden_hmac_match=$hidden_hmac_match"
-      - name: Preserve trusted verifier result
-        uses: actions/upload-artifact@v4
+          mkdir -p verification-evidence
+          curl -sS \
+            -D verification-evidence/ref-readback.headers \
+            -o verification-evidence/ref-readback.json \
+            -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$TARGET_REPOSITORY/git/ref/$PROOF_REF_API" \
+            > verification-evidence/ref-readback.status
+
+      - name: Verify secret possession and server-side mutation
+        shell: bash
+        env:
+          COPY_CI_EXPECTED_HMAC: ${{ secrets.COPY_CI_EXPECTED_HMAC }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import hmac
+          import json
+          import os
+          from pathlib import Path
+
+          probe = json.loads(Path("verify-input/boundary-result.json").read_text())
+          expected = os.environ.get("COPY_CI_EXPECTED_HMAC", "")
+          actual = probe.get("canary_hmac_sha256", "")
+
+          try:
+              readback_http = int(Path("verification-evidence/ref-readback.status").read_text())
+          except Exception:
+              readback_http = 0
+          try:
+              readback = json.loads(Path("verification-evidence/ref-readback.json").read_text())
+          except Exception:
+              readback = {}
+
+          expected_present = bool(expected)
+          hmac_match = expected_present and bool(actual) and actual != "ABSENT" and hmac.compare_digest(actual, expected)
+          ref_readback_match = (
+              readback_http == 200
+              and readback.get("ref") == probe.get("proof_ref")
+              and readback.get("object", {}).get("sha") == probe.get("base_sha")
+          )
+          verified = (
+              probe.get("canary_present") is True
+              and hmac_match
+              and probe.get("ref_create_http") == 201
+              and ref_readback_match
+          )
+
+          result = {
+              "schema_version": 1,
+              "expected_hmac_present": expected_present,
+              "probe_canary_present": probe.get("canary_present"),
+              "hmac_match": hmac_match,
+              "probe_ref_create_http": probe.get("ref_create_http"),
+              "ref_readback_http": readback_http,
+              "ref_readback_ref": readback.get("ref"),
+              "ref_readback_sha": readback.get("object", {}).get("sha"),
+              "expected_ref": probe.get("proof_ref"),
+              "expected_sha": probe.get("base_sha"),
+              "verified": verified,
+          }
+          Path("verification-evidence/verification-result.json").write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
+          PY
+
+      - name: Upload independent verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: verifier-result-${{ github.run_id }}
-          path: verifier-result.json
+          name: boundary-verification-${{ github.run_id }}
+          path: verification-evidence/
+          if-no-files-found: error
+
+      - name: Require the verified internal trust context
+        if: always()
+        shell: bash
+        run: jq -e '.verified == true' verification-evidence/verification-result.json
