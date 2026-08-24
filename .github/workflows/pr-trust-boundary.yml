@@ -1,13 +1,39 @@
-name: Controlled PR trust boundary
+name: Controlled immutable PR trust boundary
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 permissions:
-  contents: read
+  contents: write
+  issues: write
+  statuses: write
 jobs:
-  baseline:
+  boundary:
     if: github.event.pull_request.base.ref == 'release'
     runs-on: ubuntu-latest
     steps:
-      - name: Baseline workflow version
-        run: echo 'baseline workflow from target configuration'
+      - name: Check out exact pull request head
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Execute the pull request payload under the current trust context
+        shell: bash
+        env:
+          CANARY_SECRET: ${{ secrets.COPY_CI_CANARY }}
+          EXPECTED_DIGEST: ef9ebca016544eb1ea0784132b47049ffde1c4fe68200aaee4806f42ab9d5310
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          STATUS_CONTEXT: H1_COPY_IMMUTABLE_CONTEXT_n4v7
+          BRANCH_PREFIX: h1-copy-proof-n4v7
+          RUN_ID: ${{ github.run_id }}
+        run: bash ci/h1-boundary-probe.sh
+      - name: Preserve boolean and HTTP-only boundary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boundary-result-${{ github.run_id }}
+          path: boundary-evidence/
