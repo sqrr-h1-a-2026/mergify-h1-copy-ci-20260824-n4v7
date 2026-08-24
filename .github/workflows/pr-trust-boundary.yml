@@ -1,0 +1,13 @@
+name: Controlled PR trust boundary
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  baseline:
+    if: github.event.pull_request.base.ref == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baseline workflow version
+        run: echo 'baseline workflow from target configuration'
