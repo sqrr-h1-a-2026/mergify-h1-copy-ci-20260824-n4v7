@@ -8,7 +8,6 @@ pull_request_rules:
       copy:
         branches:
           - release
-        title: "Controlled copy of {{ pull_request.title }}"
         body: |
           Controlled exact copied commit lineage:
           {{ cherry_picked_commits }}
