@@ -2,37 +2,69 @@ name: Controlled immutable PR trust boundary
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-permissions:
-  contents: write
-  statuses: write
+
 jobs:
-  boundary:
+  trusted-secret-boundary:
     if: github.event.pull_request.base.ref == 'release'
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
-      - name: Check out exact pull request head
+      - name: Attest the repository secret before any untrusted checkout
+        shell: bash
+        env:
+          CANARY_SECRET: ${{ secrets.COPY_CI_CANARY }}
+          EXPECTED_HMAC: ${{ secrets.COPY_CI_EXPECTED_HMAC }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set +x
+          canary_present=false
+          hmac_match=false
+          if [ -n "$CANARY_SECRET" ]; then canary_present=true; fi
+          if [ -n "$CANARY_SECRET" ] && [ -n "$EXPECTED_HMAC" ]; then
+            actual_hmac="$(printf '%s' 'Mergify controlled Actions trust boundary n4v7' | openssl dgst -sha256 -hmac "$CANARY_SECRET" | awk '{print $2}')"
+            if [ "$actual_hmac" = "$EXPECTED_HMAC" ]; then hmac_match=true; fi
+          fi
+          jq -n --argjson canary_present "$canary_present" --argjson hidden_hmac_match "$hmac_match" \
+            --arg head_repository "$HEAD_REPOSITORY" --arg head_sha "$HEAD_SHA" \
+            '{canary_present:$canary_present,hidden_hmac_match:$hidden_hmac_match,head_repository:$head_repository,head_sha:$head_sha}' \
+            > trusted-secret-result.json
+          echo "canary_present=$canary_present hidden_hmac_match=$hmac_match"
+      - name: Preserve trusted secret attestation
+        uses: actions/upload-artifact@v4
+        with:
+          name: trusted-secret-result-${{ github.run_id }}
+          path: trusted-secret-result.json
+
+  untrusted-head-probe:
+    if: github.event.pull_request.base.ref == 'release'
+    needs: trusted-secret-boundary
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the exact pull request head
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - name: Execute the pull request payload under the current trust context
+      - name: Execute the pull request payload
         shell: bash
         env:
           CANARY_SECRET: ${{ secrets.COPY_CI_CANARY }}
-          EXPECTED_DIGEST: ef9ebca016544eb1ea0784132b47049ffde1c4fe68200aaee4806f42ab9d5310
           GH_TOKEN: ${{ github.token }}
           TARGET_REPOSITORY: ${{ github.repository }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          STATUS_CONTEXT: H1_COPY_IMMUTABLE_CONTEXT_n4v7
           BRANCH_PREFIX: h1-copy-proof-n4v7
           RUN_ID: ${{ github.run_id }}
         run: bash ci/h1-boundary-probe.sh
-      - name: Preserve boolean and HTTP-only boundary evidence
+      - name: Preserve Git Data write result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: boundary-result-${{ github.run_id }}
+          name: write-result-${{ github.run_id }}
           path: boundary-evidence/
