@@ -1,0 +1,10 @@
+pull_request_rules:
+  - name: controlled approved source copy n4v7
+    conditions:
+      - label = h1-copy-ci-n4v7
+      - base = main
+      - "#approved-reviews-by >= 1"
+    actions:
+      copy:
+        branches:
+          - release
