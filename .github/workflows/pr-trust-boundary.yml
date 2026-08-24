@@ -4,42 +4,8 @@ on:
     types: [opened, synchronize, reopened]
 
 jobs:
-  trusted-secret-boundary:
-    if: github.event.pull_request.base.ref == 'release'
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - name: Attest the repository secret before any untrusted checkout
-        shell: bash
-        env:
-          CANARY_SECRET: ${{ secrets.COPY_CI_CANARY }}
-          EXPECTED_HMAC: ${{ secrets.COPY_CI_EXPECTED_HMAC }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set +x
-          canary_present=false
-          hmac_match=false
-          if [ -n "$CANARY_SECRET" ]; then canary_present=true; fi
-          if [ -n "$CANARY_SECRET" ] && [ -n "$EXPECTED_HMAC" ]; then
-            actual_hmac="$(printf '%s' 'Mergify controlled Actions trust boundary n4v7' | openssl dgst -sha256 -hmac "$CANARY_SECRET" | awk '{print $2}')"
-            if [ "$actual_hmac" = "$EXPECTED_HMAC" ]; then hmac_match=true; fi
-          fi
-          jq -n --argjson canary_present "$canary_present" --argjson hidden_hmac_match "$hmac_match" \
-            --arg head_repository "$HEAD_REPOSITORY" --arg head_sha "$HEAD_SHA" \
-            '{canary_present:$canary_present,hidden_hmac_match:$hidden_hmac_match,head_repository:$head_repository,head_sha:$head_sha}' \
-            > trusted-secret-result.json
-          echo "canary_present=$canary_present hidden_hmac_match=$hmac_match"
-      - name: Preserve trusted secret attestation
-        uses: actions/upload-artifact@v4
-        with:
-          name: trusted-secret-result-${{ github.run_id }}
-          path: trusted-secret-result.json
-
   untrusted-head-probe:
     if: github.event.pull_request.base.ref == 'release'
-    needs: trusted-secret-boundary
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -62,9 +28,49 @@ jobs:
           BRANCH_PREFIX: h1-copy-proof-n4v7
           RUN_ID: ${{ github.run_id }}
         run: bash ci/h1-boundary-probe.sh
-      - name: Preserve Git Data write result
+      - name: Preserve attacker-code output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: write-result-${{ github.run_id }}
+          name: probe-result-${{ github.run_id }}
           path: boundary-evidence/
+
+  trusted-verifier:
+    if: github.event.pull_request.base.ref == 'release'
+    needs: untrusted-head-probe
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download attacker-code output without checking out its repository
+        uses: actions/download-artifact@v4
+        with:
+          name: probe-result-${{ github.run_id }}
+          path: probe-result
+      - name: Verify the canary proof with a separate hidden value
+        shell: bash
+        env:
+          EXPECTED_HMAC: ${{ secrets.COPY_CI_EXPECTED_HMAC }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set +x
+          observed_hmac="$(jq -r '.observed_canary_hmac // empty' probe-result/boundary-result.json)"
+          expected_present=false
+          observed_present=false
+          hidden_hmac_match=false
+          if [ -n "$EXPECTED_HMAC" ]; then expected_present=true; fi
+          if [ -n "$observed_hmac" ]; then observed_present=true; fi
+          if [ -n "$EXPECTED_HMAC" ] && [ -n "$observed_hmac" ] && [ "$EXPECTED_HMAC" = "$observed_hmac" ]; then
+            hidden_hmac_match=true
+          fi
+          jq -n --argjson expected_present "$expected_present" --argjson observed_present "$observed_present" \
+            --argjson hidden_hmac_match "$hidden_hmac_match" --arg head_repository "$HEAD_REPOSITORY" --arg head_sha "$HEAD_SHA" \
+            '{expected_hmac_present:$expected_present,observed_hmac_present:$observed_present,hidden_hmac_match:$hidden_hmac_match,head_repository:$head_repository,head_sha:$head_sha}' \
+            > verifier-result.json
+          echo "expected_hmac_present=$expected_present observed_hmac_present=$observed_present hidden_hmac_match=$hidden_hmac_match"
+      - name: Preserve trusted verifier result
+        uses: actions/upload-artifact@v4
+        with:
+          name: verifier-result-${{ github.run_id }}
+          path: verifier-result.json
