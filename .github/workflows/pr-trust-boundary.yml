@@ -11,3 +11,58 @@ jobs:
     steps:
       - name: Baseline workflow version
         run: echo 'baseline workflow from target configuration'
+name: Controlled PR trust boundary
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+  statuses: write
+jobs:
+  boundary:
+    if: github.event.pull_request.base.ref == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate secret and token boundary
+        shell: bash
+        env:
+          CANARY_SECRET: ${{ secrets.COPY_CI_CANARY }}
+          EXPECTED_DIGEST: ef9ebca016544eb1ea0784132b47049ffde1c4fe68200aaee4806f42ab9d5310
+          STATUS_CONTEXT: H1_COPY_CI_ACCESS_n4v7
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set +x
+          canary_match=false
+          if [ -n "$CANARY_SECRET" ]; then
+            actual_digest="$(printf '%s' "$CANARY_SECRET" | sha256sum | awk '{print $1}')"
+            if [ "$actual_digest" = "$EXPECTED_DIGEST" ]; then
+              canary_match=true
+            fi
+          fi
+          state=error
+          if [ "$canary_match" = true ]; then
+            state=success
+          fi
+          payload="$(jq -nc --arg state "$state" --arg context "$STATUS_CONTEXT" '{state:$state,context:$context,description:"Controlled Actions trust-boundary marker"}')"
+          status_http="$(curl -sS -o status-response.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -H 'Content-Type: application/json' \
+            --data "$payload" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA")"
+          jq -n --argjson canary_digest_match "$canary_match" \
+            --arg status_post_http "$status_http" \
+            --arg head_repository "$HEAD_REPOSITORY" \
+            --arg head_sha "$HEAD_SHA" \
+            '{canary_digest_match:$canary_digest_match,status_post_http:$status_post_http,head_repository:$head_repository,head_sha:$head_sha}' \
+            > boundary-result.json
+          echo "canary_digest_match=$canary_match"
+          echo "status_post_http=$status_http"
+      - name: Preserve boolean boundary result
+        uses: actions/upload-artifact@v4
+        with:
+          name: boundary-result-${{ github.run_id }}
+          path: boundary-result.json
